@@ -45,11 +45,15 @@ export default function VoiceAssistant({ mode = 'public' }) {
   function playReply(data) {
     const done = () => setStatus('idle')
     setStatus('speaking')
-    if (data.audio_b64) {
-      const audio = new Audio(`data:audio/mpeg;base64,${data.audio_b64}`)
+    const src = data.audio_url || (data.audio_b64 ? `data:audio/mpeg;base64,${data.audio_b64}` : null)
+    if (src) {
+      // audio_url streams from the server, so playback starts before the whole MP3 is generated
+      const audio = new Audio(src)
+      let fellBack = false
+      audio.onerror = () => { if (!fellBack) { fellBack = true; speakWithBrowser(data.reply, done) } }
       audioRef.current = audio
       audio.onended = done
-      audio.play().catch(() => speakWithBrowser(data.reply, done))
+      audio.play().catch(() => { if (!fellBack) { fellBack = true; speakWithBrowser(data.reply, done) } })
     } else {
       speakWithBrowser(data.reply, done) // TTS fallback when the speech service is down
     }

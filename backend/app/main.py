@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     groq = OpenAICompatProvider(s.groq_api_key, s.groq_model, http, timeout=s.llm_timeout_seconds)
     providers = [groq, *providers] if s.llm_primary.lower() == "groq" else [*providers, groq]
     svc = Services(settings=s, kit=kit, store=store, cache=build_cache(s.redis_url), kb=KnowledgeBase(kit),
-                   agent=Agent(FallbackLLM(providers), store, s.max_agent_steps, s.history_turns),
+                   agent=Agent(FallbackLLM(providers, call_timeout=s.llm_timeout_seconds), store, s.max_agent_steps, s.history_turns),
                    speech=SpeechService(s, http), chat_limiter=RateLimiter(s.rate_limit_per_minute),
                    login_limiter=RateLimiter(s.login_rate_limit_per_minute))
     app.state.services = svc

@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 _TOKEN = re.compile(r"[a-z0-9]+(?:\.[0-9]+)*")
 _STOP = set("the a an of to and or in on for is are be by with as at from this that it its any not no may must "
             "can will shall who what when which how do does i my me you your".split())
-_BOOST = {"circular": 1.5, "handbook": 1.0, "brochure": 1.1, "lesson_notes": 1.0}
+_BOOST = {"circular": 1.5, "notice": 1.5, "handbook": 1.0, "brochure": 1.1, "lesson_notes": 1.0}
 
 
 def _norm(token: str) -> str:
@@ -144,10 +144,18 @@ class KnowledgeBase:
             if s > 0:
                 scored.append((s * _BOOST.get(c.doc_type, 1.0), c))
         scored.sort(key=lambda x: x[0], reverse=True)
+        # Newest first among the top hits, so a later circular/notice is read before older rules.
+        top = sorted(scored[:k], key=lambda x: (x[1].doc_type in ("circular", "notice"), x[1].effective_date), reverse=True)
         return [{"source": c.title, "type": c.doc_type, "effective_date": c.effective_date,
-                 "text": c.text[:900]} for _, c in scored[:k]]
+                 "text": c.text[:900]} for _, c in top]
 
     def catalogue(self) -> list[dict]:
         return [{"id": d["id"], "title": d.get("title"), "type": d.get("type"),
                  "effective_date": d.get("effective_date"), "is_new": d.get("is_surprise", False)}
-                for d in self.documents]
+                for d in sorted(self.documents, key=lambda d: d.get("effective_date") or "", reverse=True)]
+
+    def latest_updates(self, limit: int = 5) -> list[str]:
+        """Titles of the newest circulars/notices, injected into the system prompt."""
+        docs = [d for d in self.documents if d.get("type") in ("circular", "notice") or d.get("is_surprise")]
+        docs.sort(key=lambda d: d.get("effective_date") or "", reverse=True)
+        return [f"{d.get('title')} (effective {d.get('effective_date')})" for d in docs[:limit]]

@@ -45,9 +45,27 @@ def is_working_day(d: date, calendar_events: list[dict]) -> bool:
            for e in calendar_events):
         return False
     if any(e.get("type") in ("working_day", "special_working_day") and e.get("date") == d.isoformat()
-           for e in calendar_events):
+           and e.get("status", "active") == "active" for e in calendar_events):
         return True
-    return d.weekday() != 6  # Sunday off by default
+    return d.weekday() < 5  # Mon-Fri; Saturdays only when declared working days by the calendar/circular
+
+
+def timetable_weekday(d: date, calendar_events: list[dict]) -> int:
+    """ISO weekday whose timetable runs on ``d`` (a working Saturday may follow e.g. Monday's timetable)."""
+    for e in calendar_events:
+        if e.get("date") == d.isoformat() and e.get("follows_weekday"):
+            return int(e["follows_weekday"])
+    return d.isoweekday()
+
+
+def add_working_days(start: date, n: int, calendar_events: list[dict]) -> date:
+    """Date that is ``n`` working days after ``start`` (declared working Saturdays count, holidays don't)."""
+    d, count = start, 0
+    while count < n:
+        d += timedelta(days=1)
+        if is_working_day(d, calendar_events):
+            count += 1
+    return d
 
 
 def check_leave_request(req: dict, today: date, calendar_events: list[dict],
@@ -103,8 +121,10 @@ def check_leave_request(req: dict, today: date, calendar_events: list[dict],
     if rtype == "personal_leave" and len(working) > 3:
         r.warnings.append("Personal leave over three consecutive working days also needs HOD approval (Rule 6.1.3).")
     if rtype == "on_duty":
-        r.warnings.append("Submit proof of participation within 3 working days after the event (Circular 12/2026), "
-                          "or the on-duty is rejected and counted as absent.")
+        due = add_working_days(end, 3, calendar_events)
+        r.info["od_proof_due"] = due.isoformat()
+        r.warnings.append(f"Submit proof of participation by {due.isoformat()}, within 3 working days after the event "
+                          "(Circular 12/2026), or the on-duty is rejected and counted as absent.")
     if rtype == "medical_leave":
         r.warnings.append("Submit the medical certificate within 3 working days of returning (Rule 6.3.3).")
 
@@ -122,17 +142,21 @@ def check_leave_request(req: dict, today: date, calendar_events: list[dict],
 
     # Attendance impact (Rule 4.2.2 / 6.1.5): leave periods count as absent.
     if rtype != "on_duty" and attendance and working:
-        proj = project_attendance(attendance, timetable or [], working)
+        proj = project_attendance(attendance, timetable or [], working, calendar_events)
         r.info["attendance_projection"] = proj
         if proj and proj["projected_percentage"] < MIN_ATTENDANCE:
             r.warnings.append(
                 f"This leave would bring your attendance from {proj['current_percentage']}% to about "
                 f"{proj['projected_percentage']}%, below the 75% minimum (Chapter 4).")
     r.info["working_days"] = [d.isoformat() for d in working]
+    r.info["calendar_used"] = [{"date": e.get("date"), "type": e.get("type"), "title": e.get("title")}
+                               for e in calendar_events if e.get("status", "active") == "active"]
+    r.info["source"] = "Live academic calendar (already reflects rescheduling circulars) + Handbook 2026 Chapter 6"
     return r
 
 
-def project_attendance(attendance: dict, timetable: list[dict], leave_days: list[date]) -> dict | None:
+def project_attendance(attendance: dict, timetable: list[dict], leave_days: list[date],
+                       calendar_events: list[dict] | None = None) -> dict | None:
     """Estimate attendance after missing the classes on ``leave_days`` (tracked subjects only)."""
     held = attendance.get("total_classes_held") or 0
     attended = attendance.get("total_classes_attended") or 0
@@ -141,7 +165,7 @@ def project_attendance(attendance: dict, timetable: list[dict], leave_days: list
     tracked = {s.get("subject_code") for s in attendance.get("subjects", [])}
     missed = 0
     for d in leave_days:
-        weekday = d.isoweekday()  # API uses 1=Monday
+        weekday = timetable_weekday(d, calendar_events or [])  # API uses 1=Monday
         slots = [t for t in timetable if t.get("weekday") == weekday and (not tracked or t.get("subject_code") in tracked)]
         missed += len(slots) if timetable else 1
     new_held = held + missed

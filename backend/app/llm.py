@@ -22,9 +22,10 @@ log = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, retryable: bool = True):
+    def __init__(self, message: str, retryable: bool = True, cooldown: bool = True):
         super().__init__(message)
         self.retryable = retryable
+        self.cooldown = cooldown  # False for request-specific failures (e.g. an empty answer)
 
 
 @dataclass
@@ -41,8 +42,9 @@ class LLMProvider(Protocol):
 
 
 def _classify(resp: httpx.Response) -> ProviderError:
-    retryable = resp.status_code == 429 or resp.status_code >= 500
-    return ProviderError(f"HTTP {resp.status_code}: {resp.text[:200]}", retryable=retryable)
+    # 429 (quota) -> switch provider immediately: the next one answers faster than any backoff.
+    # 5xx (transient overload) -> one quick retry with backoff + jitter.
+    return ProviderError(f"HTTP {resp.status_code}: {resp.text[:600]}", retryable=resp.status_code >= 500)
 
 
 class GeminiProvider:
@@ -105,6 +107,8 @@ class GeminiProvider:
         try:
             resp = await self.client.post(self.URL.format(model=self.model), json=body,
                                           headers={"x-goog-api-key": self.api_key}, timeout=self.timeout)
+        except httpx.TimeoutException:
+            raise ProviderError("timeout", retryable=False)
         except httpx.HTTPError as exc:
             raise ProviderError(f"network: {exc.__class__.__name__}")
         if resp.status_code != 200:
@@ -118,7 +122,8 @@ class GeminiProvider:
         calls = [{"id": uuid.uuid4().hex[:12], "name": p["functionCall"]["name"],
                   "args": p["functionCall"].get("args") or {}} for p in parts if "functionCall" in p]
         if not text and not calls:
-            raise ProviderError("empty response")
+            reason = cands[0].get("finishReason")
+            raise ProviderError(f"empty response (finishReason={reason})", retryable=False, cooldown=False)
         return LLMResult(text, calls, raw=parts, provider=self.name)
 
 
@@ -178,8 +183,10 @@ class OpenAICompatProvider:
 class FallbackLLM:
     """Tries each provider in order, with exponential backoff + jitter on retryable errors."""
 
-    def __init__(self, providers: list[LLMProvider], attempts: int = 2, base_delay: float = 0.4):
+    def __init__(self, providers: list[LLMProvider], attempts: int = 2, base_delay: float = 0.4,
+                 call_timeout: float | None = 8.0):
         self.providers = providers
+        self.call_timeout = call_timeout
         self.attempts = attempts
         self.base_delay = base_delay
         self.status: dict[str, dict] = {p.name: {"ok": None, "last_error": None, "at": None} for p in providers}
@@ -194,7 +201,11 @@ class FallbackLLM:
         for p in ready:
             for attempt in range(self.attempts):
                 try:
-                    result = await p.generate(system, messages, tools)
+                    try:
+                        result = await asyncio.wait_for(p.generate(system, messages, tools), self.call_timeout)
+                    except asyncio.TimeoutError:
+                        # A slow provider is treated as down: don't retry it, fall over to the next one.
+                        raise ProviderError(f"timeout after {self.call_timeout}s", retryable=False)
                     self._cooldown_until.pop(p.name, None)
                     self.status[p.name] = {"ok": True, "last_error": None, "at": time.time()}
                     return result
@@ -203,7 +214,10 @@ class FallbackLLM:
                     self.status[p.name] = {"ok": False, "last_error": str(exc)[:200], "at": time.time()}
                     errors.append(f"{p.name}: {exc}")
                     if not exc.retryable or attempt == self.attempts - 1:
-                        self._cooldown_until[p.name] = time.time() + self.cooldown_seconds
+                        if exc.cooldown:
+                            # A daily free-tier quota won't recover in seconds: park that model for 10 minutes.
+                            wait = 600.0 if "PerDay" in str(exc) else self.cooldown_seconds
+                            self._cooldown_until[p.name] = time.time() + wait
                         break
                     await asyncio.sleep(min(4.0, self.base_delay * 2 ** attempt) + random.uniform(0, 0.3))
         raise ProviderError("All LLM providers failed: " + " | ".join(errors), retryable=False)
