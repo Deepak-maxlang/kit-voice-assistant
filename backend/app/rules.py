@@ -9,7 +9,12 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Iterable
 
-MIN_ATTENDANCE = 75.0
+MIN_ATTENDANCE = 75.0          # B.Tech (Chapter 4)
+MIN_ATTENDANCE_PG = 80.0       # M.Tech, raised in Handbook 2026 (Rule 5.1.1)
+
+
+def min_attendance(profile: dict | None) -> float:
+    return MIN_ATTENDANCE_PG if (profile or {}).get("programme") == "PG" else MIN_ATTENDANCE
 REQUEST_TYPES = {"personal_leave", "medical_leave", "on_duty"}
 ACTIVE_STATUSES = {"pending", "approved", "proof_pending", "proof pending"}
 
@@ -71,7 +76,7 @@ def add_working_days(start: date, n: int, calendar_events: list[dict]) -> date:
 def check_leave_request(req: dict, today: date, calendar_events: list[dict],
                         existing_requests: list[dict] | None = None,
                         attendance: dict | None = None,
-                        timetable: list[dict] | None = None) -> RuleResult:
+                        timetable: list[dict] | None = None, minimum: float = MIN_ATTENDANCE) -> RuleResult:
     """Validate a leave / on-duty request against handbook rules."""
     r = RuleResult()
     rtype = (req.get("type") or "").strip()
@@ -144,10 +149,11 @@ def check_leave_request(req: dict, today: date, calendar_events: list[dict],
     if rtype != "on_duty" and attendance and working:
         proj = project_attendance(attendance, timetable or [], working, calendar_events)
         r.info["attendance_projection"] = proj
-        if proj and proj["projected_percentage"] < MIN_ATTENDANCE:
+        if proj and proj["projected_percentage"] < minimum:
             r.warnings.append(
                 f"This leave would bring your attendance from {proj['current_percentage']}% to about "
-                f"{proj['projected_percentage']}%, below the 75% minimum (Chapter 4).")
+                f"{proj['projected_percentage']}%, below the {minimum:g}% minimum "
+                f"({'Rule 5.1.1' if minimum > MIN_ATTENDANCE else 'Chapter 4'}).")
     r.info["working_days"] = [d.isoformat() for d in working]
     r.info["calendar_used"] = [{"date": e.get("date"), "type": e.get("type"), "title": e.get("title")}
                                for e in calendar_events if e.get("status", "active") == "active"]
@@ -176,9 +182,12 @@ def project_attendance(attendance: dict, timetable: list[dict], leave_days: list
     }
 
 
-def check_placement_eligibility(drive: dict, profile: dict, academics: dict, today: date | None = None) -> RuleResult:
-    """Handbook Chapter 10 style eligibility using the drive's published criteria."""
+def check_placement_eligibility(drive: dict, profile: dict, academics: dict, today: date | None = None,
+                                registrations: list[dict] | None = None) -> RuleResult:
+    """Handbook 2026 Chapter 10 eligibility using the drive's published criteria and the student's offers."""
     r = RuleResult()
+    if any((reg.get("drive_id") or reg.get("id")) == drive.get("id") for reg in registrations or []):
+        r.fail(f"You are already registered for {drive.get('company')} (Rule 10.4.3).")
     year = profile.get("year_of_study")
     if drive.get("eligible_years") and year not in drive["eligible_years"]:
         r.fail(f"{drive.get('company')} is open only to year {', '.join(map(str, drive['eligible_years']))} students; "
@@ -191,8 +200,13 @@ def check_placement_eligibility(drive: dict, profile: dict, academics: dict, tod
         r.fail(f"Minimum CGPA is {drive['min_cgpa']}; yours is {cgpa}.")
     if not drive.get("allow_standing_arrears", True) and (academics.get("standing_arrears") or 0) > 0:
         r.fail("This drive does not allow standing arrears.")
-    if academics.get("placed_company"):
-        r.warnings.append(f"You are already placed at {academics['placed_company']}; placement policy may restrict further drives.")
+    placed = academics.get("placed_category")
+    if placed == "dream" and drive.get("category") != "dream":
+        r.fail(f"You already hold a dream offer ({academics.get('placed_company')}), so you can't register for "
+               "non-dream drives (Rule 10.3.2).")
+    elif placed == "non_dream" and drive.get("category") != "dream":
+        r.fail(f"You already hold a non-dream offer ({academics.get('placed_company')}); only dream drives are "
+               "open to you (Rule 10.3.3).")
     if today and drive.get("deadline") and parse_date(drive["deadline"]) < today:
         r.fail(f"The registration deadline ({drive['deadline']}) has passed.")
     if drive.get("seats_left") == 0:

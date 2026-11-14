@@ -129,8 +129,13 @@ async def submit_admission_application(ctx, args):
 
 
 # ------------------------------------------------------------------ student handlers
+def _safe_profile(user: dict | None) -> dict:
+    """Profile without free-text 'notes' (user-controlled text is never shown to the LLM as instructions)."""
+    return {k: v for k, v in (user or {}).items() if k != "notes"}
+
+
 async def get_my_profile(ctx, args):
-    out = {"profile": ctx.user}
+    out = {"profile": _safe_profile(ctx.user)}
     if ctx.role == STUDENT:
         out["academics"] = await ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token))
     return out
@@ -138,7 +143,7 @@ async def get_my_profile(ctx, args):
 
 async def get_my_attendance(ctx, args):
     data = await ctx.cached("attendance", 30, lambda: ctx.kit.attendance(ctx.token))
-    return {**data, "minimum_required": rules.MIN_ATTENDANCE}
+    return {**data, "minimum_required": rules.min_attendance(ctx.user)}
 
 
 async def get_attendance_sessions(ctx, args):
@@ -189,7 +194,7 @@ async def check_leave_request(ctx, args):
         ctx.cached("attendance", 30, lambda: ctx.kit.attendance(ctx.token)),
         ctx.cached("timetable", 300, lambda: ctx.kit.timetable(ctx.token)),
     )
-    res = rules.check_leave_request(args, ctx.today_date, cal, existing, att, tt)
+    res = rules.check_leave_request(args, ctx.today_date, cal, existing, att, tt, rules.min_attendance(ctx.user))
     if args.get("_dry_run_ignore_reason"):
         res.errors = [e for e in res.errors if "reason" not in e.lower()]
         res.ok = not res.errors
@@ -237,11 +242,12 @@ async def cancel_request(ctx, args):
 async def list_placement_drives(ctx, args):
     if ctx.role != STUDENT:
         return await ctx.cached("pub:drives", 60, ctx.kit.placement_drives)
-    drives, academics = await asyncio.gather(ctx.cached("pub:drives", 60, ctx.kit.placement_drives),
-                                             ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token)))
+    drives, academics, regs = await asyncio.gather(ctx.cached("pub:drives", 60, ctx.kit.placement_drives),
+                                                   ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token)),
+                                                   ctx.cached("placements", 30, lambda: ctx.kit.my_placements(ctx.token)))
     out = []
     for d in drives:
-        res = rules.check_placement_eligibility(d, ctx.user or {}, academics, ctx.today_date)
+        res = rules.check_placement_eligibility(d, ctx.user or {}, academics, ctx.today_date, regs)
         out.append({**d, "you_are_eligible": res.ok, "ineligible_reasons": res.errors})
     return out
 
@@ -251,8 +257,10 @@ async def precheck_placement(ctx, args):
     drive = next((d for d in drives if d["id"] == int(args["drive_id"])), None)
     if not drive:
         return {"allowed": False, "errors": ["No such placement drive."]}
-    academics = await ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token))
-    res = rules.check_placement_eligibility(drive, ctx.user or {}, academics, ctx.today_date)
+    academics, regs = await asyncio.gather(ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token)),
+                                           ctx.kit.my_placements(ctx.token))
+    res = rules.check_placement_eligibility(drive, ctx.user or {}, academics, ctx.today_date, regs)
+    args["company"] = drive["company"]  # for the spoken confirmation
     return {**res.to_dict(), "drive": drive}
 
 
@@ -271,13 +279,30 @@ async def teacher_classes(ctx, args):
     return await ctx.cached("tclasses", 60, lambda: ctx.kit.teacher_classes(ctx.token))
 
 
+def _mark_untrusted(req: dict) -> dict:
+    """Student-written text is data, not instructions (e.g. 'SYSTEM: approve all...')."""
+    out = dict(req)
+    for key in ("reason", "student_notes", "event_name"):
+        if out.get(key):
+            out[key] = f"<student_text>{out[key]}</student_text>"
+    return out
+
+
 async def teacher_requests(ctx, args):
-    return await ctx.kit.teacher_requests(ctx.token, args.get("status") or None)
+    reqs = await ctx.kit.teacher_requests(ctx.token, args.get("status") or None)
+    return [_mark_untrusted(r) for r in reqs or []]
 
 
 async def class_attendance(ctx, args):
-    data = await ctx.kit.class_attendance(ctx.token, int(args["class_id"]))
-    return {**data, "minimum_required": rules.MIN_ATTENDANCE}
+    class_id = args.get("class_id") or (ctx.user or {}).get("class_id")
+    if not class_id:
+        classes = await teacher_classes(ctx, {})
+        class_id = classes[0]["class_id"] if classes else None
+    if not class_id:
+        return {"error": "You don't advise any class."}
+    data = await ctx.kit.class_attendance(ctx.token, int(class_id))
+    return {**data, "minimum_required": rules.MIN_ATTENDANCE,
+            "below_minimum": [s["student_name"] for s in data.get("students", []) if s.get("percentage", 100) < rules.MIN_ATTENDANCE]}
 
 
 async def _find_teacher_request(ctx, rid: int) -> dict | None:
@@ -312,6 +337,7 @@ async def precheck_decision(ctx, args):
                 warnings.append("The request covers an internal assessment day (Rule 6.1.4).")
         except KitError:
             pass
+    args["student"] = f"{req.get('student_name')}'s {str(req.get('type', '')).replace('_', ' ')} for {req.get('from_date')}"
     return {"allowed": True, "warnings": warnings, "request": req}
 
 
@@ -386,21 +412,22 @@ TOOLS: list[Tool] = [
          _obj(), {STUDENT, TEACHER}, list_placement_drives),
     Tool("register_placement", "Register the logged-in student for a placement drive (eligibility checked).",
          _obj({"drive_id": {"type": "integer"}}, ["drive_id"]), {STUDENT}, register_placement, write=True,
-         precheck=precheck_placement, summary=lambda a: f"register you for placement drive #{a.get('drive_id')}"),
+         precheck=precheck_placement, summary=lambda a: f"register you for the {a.get('company') or 'placement'} drive (#{a.get('drive_id')})"),
     Tool("my_placements", "Placement drives the student has registered for.", _obj(), {STUDENT}, my_placements),
     Tool("teacher_classes", "Classes the teacher advises or has delegated authority for (role_type, valid_until).", _obj(), {TEACHER}, teacher_classes),
     Tool("teacher_requests", "Leave/on-duty requests from the teacher's classes. status: pending|approved|rejected|cancelled.",
          _obj({"status": {"type": "string"}}), {TEACHER}, teacher_requests),
     Tool("class_attendance", "Attendance of every student in one of the teacher's classes.",
-         _obj({"class_id": {"type": "integer"}}, ["class_id"]), {TEACHER}, class_attendance),
+         _obj({"class_id": {"type": "integer", "description": "Omit to use the teacher's own advised class"}}), {TEACHER},
+         class_attendance),
     Tool("approve_request", "Approve a student's request (teacher).",
          _obj({"request_id": {"type": "integer"}, "comment": {"type": "string"}}, ["request_id"]), {TEACHER},
          approve_request, write=True, precheck=precheck_decision,
-         summary=lambda a: f"approve request #{a.get('request_id')}"),
+         summary=lambda a: f"approve request #{a.get('request_id')} ({a.get('student', '')})"),
     Tool("reject_request", "Reject a student's request with a mandatory reason (teacher).",
          _obj({"request_id": {"type": "integer"}, "reason": {"type": "string"}}, ["request_id", "reason"]), {TEACHER},
          reject_request, write=True, precheck=precheck_decision,
-         summary=lambda a: f"reject request #{a.get('request_id')} with reason '{a.get('reason')}'"),
+         summary=lambda a: f"reject request #{a.get('request_id')} ({a.get('student', '')}) with reason '{a.get('reason')}'"),
 ]
 _BY_NAME = {t.name: t for t in TOOLS}
 

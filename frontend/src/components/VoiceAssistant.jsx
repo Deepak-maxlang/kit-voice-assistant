@@ -8,6 +8,11 @@ const GREETING = {
   student: 'Hi! Ask me about your attendance, timetable, leave or on-duty requests, placements, rules or DBMS doubts.',
   teacher: 'Hello! I can show your classes and attendance, and approve or reject leave and on-duty requests.',
 }
+const CHIPS = {
+  public: ['Fees for CSE', 'Am I eligible with 72% for CSE?', 'Apply for admission', 'Placement drives', 'Documents needed'],
+  student: ['My attendance', 'Apply leave', 'On-duty request', 'Placement drives', 'DBMS doubt: what is BCNF?'],
+  teacher: ['Pending requests', 'Class attendance', 'My classes'],
+}
 const SILENCE_MS = 1300
 const MAX_RECORD_MS = 20000
 
@@ -31,6 +36,14 @@ export default function VoiceAssistant({ mode = 'public' }) {
   const audioRef = useRef(null)
   const vadRef = useRef(null)
   const endRef = useRef(null)
+  const [seconds, setSeconds] = useState(0)
+
+  useEffect(() => {
+    if (status !== 'recording') return undefined
+    setSeconds(0)
+    const t = setInterval(() => setSeconds((x) => x + 1), 1000)
+    return () => clearInterval(t)
+  }, [status])
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, status])
   useEffect(() => () => stopEverything(), [])
@@ -79,9 +92,9 @@ export default function VoiceAssistant({ mode = 'public' }) {
     }
   }
 
-  async function sendText(e) {
-    e.preventDefault()
-    const msg = text.trim()
+  async function sendText(e, preset) {
+    e?.preventDefault()
+    const msg = (preset ?? text).trim()
     if (!msg || status === 'thinking') return
     stopEverything()
     setText('')
@@ -150,9 +163,14 @@ export default function VoiceAssistant({ mode = 'public' }) {
     else if (status !== 'thinking') { stopEverything(); startRecording() }
   }
 
+  const busy = status === 'thinking'
   return (
-    <div className="assistant">
-      <div className="messages">
+    <div className="assistant panel" aria-label="Voice assistant">
+      <div className="assistant-head">
+        <span className="dot" aria-hidden="true" /> <b>KIT Assistant</b>
+        <span className="muted small">{mode === 'public' ? 'Admissions help' : `${mode} services`}</span>
+      </div>
+      <div className="messages" aria-live="polite">
         {messages.map((m, i) => (
           <div key={i} className={`bubble ${m.role}`}>
             <span>{m.content}</span>
@@ -161,19 +179,32 @@ export default function VoiceAssistant({ mode = 'public' }) {
             )}
           </div>
         ))}
-        {status === 'thinking' && <div className="bubble assistant muted">…</div>}
+        {busy && <div className="bubble assistant typing" aria-label="Thinking"><i /><i /><i /></div>}
         <div ref={endRef} />
       </div>
-      <div className="controls">
-        <button className={`mic ${status}`} onClick={onMicClick} disabled={status === 'thinking'} aria-label={LABELS[status]}>
-          {status === 'recording' ? '■' : '🎤'}
-        </button>
-        <span className="status">{LABELS[status]}</span>
+
+      <div className="chips" aria-label="Suggestions">
+        {(CHIPS[mode] || CHIPS.public).map((c) => (
+          <button key={c} type="button" className="chip" disabled={busy} onClick={() => sendText(null, c)}>{c}</button>
+        ))}
       </div>
-      {error && <p className="error">{error}</p>}
+
+      <div className="controls">
+        <button className={`mic ${status}`} onClick={onMicClick} disabled={busy} aria-label={LABELS[status]}>
+          {status === 'thinking' ? <span className="spinner light" /> :
+            status === 'speaking' ? <span className="eq" aria-hidden="true"><i /><i /><i /><i /></span> :
+              status === 'recording' ? <span className="stop" aria-hidden="true" /> : <span aria-hidden="true">🎤</span>}
+        </button>
+        <div className="status" role="status">
+          <b>{LABELS[status]}</b>
+          {status === 'recording' && <span className="timer">0:{String(seconds).padStart(2, '0')}</span>}
+          <small className="muted">{status === 'recording' ? 'Stops automatically when you pause' : 'Speech-to-text by Deepgram'}</small>
+        </div>
+      </div>
+      {error && <p className="error" role="alert">{error}</p>}
       <form className="text-input" onSubmit={sendText}>
-        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Or type your question…" maxLength={2000} />
-        <button disabled={!text.trim() || status === 'thinking'}>Send</button>
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Or type your question…" maxLength={2000} aria-label="Type your question" />
+        <button className="btn-primary" disabled={!text.trim() || busy}>Send</button>
       </form>
     </div>
   )
