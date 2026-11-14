@@ -53,7 +53,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" />} />
         </Routes>
       </main>
-      <footer className="footer">© Knotopian Institute of Technology · Voice assistant powered by Deepgram + Gemini</footer>
+      <footer className="footer">© Knotopian Institute of Technology</footer>
     </>
   )
 }
