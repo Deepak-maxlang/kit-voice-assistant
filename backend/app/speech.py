@@ -9,6 +9,14 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# College vocabulary to bias recognition (e.g. "fees" was heard as "pieces").
+VOCAB = ["fees", "hostel", "CSE", "ECE", "MECH", "B.Tech", "M.Tech", "on-duty", "OD", "leave", "attendance",
+         "admission", "eligibility", "placement", "CS304", "DBMS", "circular", "KIT", "Knotopian", "semester",
+         "internal assessment", "tuition"]
+WHISPER_PROMPT = ("KIT (Knotopian Institute of Technology) college assistant. Topics: course fees, hostel fees, "
+                  "admission, eligibility, CSE, ECE, MECH, B.Tech, M.Tech, attendance, leave, on-duty (OD), "
+                  "placement, CS304 DBMS, internal assessment, circular, semester.")
+
 
 class SpeechService:
     def __init__(self, settings, client: httpx.AsyncClient):
@@ -21,11 +29,14 @@ class SpeechService:
         self.status[name] = {"ok": ok, "last_error": err, "at": time.time()}
 
     async def _deepgram_stt(self, audio: bytes, content_type: str) -> str:
-        resp = await self.client.post(
-            "https://api.deepgram.com/v1/listen",
-            params={"model": self.s.deepgram_stt_model, "smart_format": "true", "language": "en"},
-            headers={"Authorization": f"Token {self.s.deepgram_api_key}", "Content-Type": content_type or "audio/webm"},
-            content=audio, timeout=20)
+        base = [("model", self.s.deepgram_stt_model), ("smart_format", "true"), ("language", "en")]
+        headers = {"Authorization": f"Token {self.s.deepgram_api_key}", "Content-Type": content_type or "audio/webm"}
+        # nova-3 takes repeatable `keyterm` params; if a model rejects them, retry once without.
+        resp = await self.client.post("https://api.deepgram.com/v1/listen", params=base + [("keyterm", t) for t in VOCAB],
+                                      headers=headers, content=audio, timeout=20)
+        if resp.status_code == 400:
+            resp = await self.client.post("https://api.deepgram.com/v1/listen", params=base, headers=headers,
+                                          content=audio, timeout=20)
         resp.raise_for_status()
         alts = resp.json()["results"]["channels"][0]["alternatives"]
         return (alts[0].get("transcript") or "").strip() if alts else ""
@@ -34,7 +45,7 @@ class SpeechService:
         resp = await self.client.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {self.s.groq_api_key}"},
-            data={"model": self.s.groq_stt_model, "language": "en", "response_format": "json"},
+            data={"model": self.s.groq_stt_model, "language": "en", "response_format": "json", "prompt": WHISPER_PROMPT},
             files={"file": (filename or "audio.webm", audio, content_type or "audio/webm")}, timeout=30)
         resp.raise_for_status()
         return (resp.json().get("text") or "").strip()

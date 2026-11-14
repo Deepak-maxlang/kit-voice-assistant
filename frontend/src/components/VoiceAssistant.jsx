@@ -289,9 +289,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
         {messages.map((m, i) => (
           <div key={i} className={`bubble ${m.role}`}>
             <span>{m.content}</span>
-            {m.actions?.length > 0 && (
-              <small className="actions">{m.actions.map((a) => `${a.tool.replaceAll('_', ' ')}: ${a.status.replaceAll('_', ' ')}`).join(' · ')}</small>
-            )}
+            {/* tool statuses stay in history meta only; not shown to users */}
           </div>
         ))}
         {busy && <div className="bubble assistant typing" aria-label="Thinking"><i /><i /><i /></div>}
