@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     groq_api_key: str = ""
     deepgram_api_key: str = ""
-    gemini_models: str = "gemini-3.1-flash-lite,gemini-2.5-flash"
+    gemini_models: str = "gemini-flash-lite-latest,gemini-3.1-flash-lite"
     groq_model: str = "openai/gpt-oss-120b"
     llm_primary: str = "gemini"  # "gemini" or "groq": which provider family is tried first
     groq_stt_model: str = "whisper-large-v3-turbo"
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     login_rate_limit_per_minute: int = 8
     max_agent_steps: int = 5
     history_turns: int = 10
-    llm_timeout_seconds: float = 12.0
+    llm_timeout_seconds: float = 8.0  # per call; on timeout we move to the next provider
 
     @property
     def gemini_model_list(self) -> list[str]:

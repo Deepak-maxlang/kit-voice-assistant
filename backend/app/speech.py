@@ -59,6 +59,22 @@ class SpeechService:
                 self._mark("groq_whisper", False, str(exc)[:200])
         return "", None
 
+    async def stream_speech(self, text: str):
+        """Yield MP3 bytes from Deepgram Aura as they are generated (playback starts on the first chunk)."""
+        try:
+            async with self.client.stream(
+                    "POST", "https://api.deepgram.com/v1/speak",
+                    params={"model": self.s.deepgram_tts_model, "encoding": "mp3"},
+                    headers={"Authorization": f"Token {self.s.deepgram_api_key}"},
+                    json={"text": text[:1900]}, timeout=20) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            self._mark("deepgram_tts", True)
+        except Exception as exc:
+            log.warning("Deepgram TTS stream failed: %s", exc)
+            self._mark("deepgram_tts", False, str(exc)[:200])
+
     async def synthesize(self, text: str) -> str | None:
         """Base64 MP3 from Deepgram Aura, or None so the browser falls back to speechSynthesis."""
         if not self.s.deepgram_api_key or not text:

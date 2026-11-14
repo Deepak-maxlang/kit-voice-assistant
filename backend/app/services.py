@@ -1,6 +1,8 @@
 """Shared service container and per-request helpers (session, tool context, a full assistant turn)."""
 from __future__ import annotations
 
+import asyncio
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,7 +56,7 @@ async def college_today(svc: Services) -> dict:
     today = svc.cache.get("pub:today")
     if today is None:
         today = await svc.kit.today()
-        svc.cache.set("pub:today", today, 60)
+        svc.cache.set("pub:today", today, 120)
     return today
 
 
@@ -78,6 +80,12 @@ def check_rate(limiter: RateLimiter, request: Request) -> None:
         raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
 
 
+def tts_url(svc: Services, session: dict, text: str) -> str:
+    tts_id = uuid.uuid4().hex
+    svc.cache.set(f"tts:{tts_id}", {"text": text, "sid": session["sid"]}, 120)
+    return f"/api/tts/{tts_id}"
+
+
 async def run_turn(svc: Services, session: dict, text: str, conversation_id: str | None, speak: bool) -> dict[str, Any]:
     owner = owner_key(session)
     ctx = await tool_context(svc, session)
@@ -85,11 +93,17 @@ async def run_turn(svc: Services, session: dict, text: str, conversation_id: str
     if not conv:
         conversation_id = svc.store.create_conversation(owner, ctx.role, text)
     result = await svc.agent.handle(ctx, conversation_id, text)
-    svc.store.add_message(conversation_id, "user", text)
-    svc.store.add_message(conversation_id, "assistant", result["reply"],
-                          {"actions": [{k: v for k, v in a.items() if k != "result"} for a in result["actions"]],
-                           "provider": result.get("provider")})
-    audio = await svc.speech.synthesize(result["reply"]) if speak else None
-    return {"conversation_id": conversation_id, "reply": result["reply"], "audio_b64": audio,
+
+    def persist() -> None:
+        svc.store.add_message(conversation_id, "user", text)
+        svc.store.add_message(conversation_id, "assistant", result["reply"],
+                              {"actions": [{k: v for k, v in a.items() if k != "result"} for a in result["actions"]],
+                               "provider": result.get("provider")})
+
+    await asyncio.to_thread(persist)
+    # Don't wait for the whole MP3: hand back a one-time URL that streams Deepgram audio as it is generated,
+    # so the browser starts speaking within a few hundred ms. Falls back to speechSynthesis on error.
+    audio_url = tts_url(svc, session, result["reply"]) if speak and svc.settings.deepgram_api_key else None
+    return {"conversation_id": conversation_id, "reply": result["reply"], "audio_b64": None, "audio_url": audio_url,
             "actions": [{k: v for k, v in a.items() if k != "result"} for a in result["actions"]],
             "provider": result.get("provider")}

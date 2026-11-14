@@ -7,6 +7,7 @@ the rules, then held as a *pending action* until the user confirms.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Awaitable, Callable
@@ -82,7 +83,7 @@ async def list_courses(ctx, args):
 async def search_documents(ctx, args):
     types = None
     if ctx.role == PUBLIC:
-        types = {"brochure", "handbook", "circular"}
+        types = {"brochure", "handbook", "circular", "notice"}
     hits = ctx.kb.search(args.get("query", ""), k=4, doc_types=types) if ctx.kb else []
     return {"results": hits, "note": "Latest circular prevails over the handbook (Rule 1.4)."} if hits else \
         {"results": [], "note": "No matching passage found in the college documents."}
@@ -181,10 +182,13 @@ async def check_leave_request(ctx, args):
         end = rules.parse_date(args["to_date"])
     except (KeyError, ValueError):
         return {"allowed": False, "errors": ["Please give the date(s) as YYYY-MM-DD."]}
-    cal = await _calendar(ctx, start.isoformat(), max(start, end).isoformat())
-    existing = await list_my_requests(ctx, {})
-    att = await ctx.cached("attendance", 30, lambda: ctx.kit.attendance(ctx.token))
-    tt = await ctx.cached("timetable", 300, lambda: ctx.kit.timetable(ctx.token))
+    # Calendar runs to +14 days so the OD proof deadline (3 working days) sees holidays / working Saturdays.
+    cal, existing, att, tt = await asyncio.gather(
+        _calendar(ctx, start.isoformat(), (max(start, end) + timedelta(days=14)).isoformat()),
+        list_my_requests(ctx, {}),
+        ctx.cached("attendance", 30, lambda: ctx.kit.attendance(ctx.token)),
+        ctx.cached("timetable", 300, lambda: ctx.kit.timetable(ctx.token)),
+    )
     res = rules.check_leave_request(args, ctx.today_date, cal, existing, att, tt)
     if args.get("_dry_run_ignore_reason"):
         res.errors = [e for e in res.errors if "reason" not in e.lower()]
@@ -194,6 +198,7 @@ async def check_leave_request(ctx, args):
 
 async def check_leave_tool(ctx, args):
     args = dict(args)
+    args.setdefault("type", "personal_leave")
     if not args.get("reason"):
         args["_dry_run_ignore_reason"] = True
     if args.get("type") == "on_duty" and not args.get("event_name"):
@@ -230,10 +235,10 @@ async def cancel_request(ctx, args):
 
 
 async def list_placement_drives(ctx, args):
-    drives = await ctx.cached("pub:drives", 60, ctx.kit.placement_drives)
     if ctx.role != STUDENT:
-        return drives
-    academics = await ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token))
+        return await ctx.cached("pub:drives", 60, ctx.kit.placement_drives)
+    drives, academics = await asyncio.gather(ctx.cached("pub:drives", 60, ctx.kit.placement_drives),
+                                             ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token)))
     out = []
     for d in drives:
         res = rules.check_placement_eligibility(d, ctx.user or {}, academics, ctx.today_date)
@@ -285,9 +290,16 @@ async def _find_teacher_request(ctx, rid: int) -> dict | None:
 
 
 async def precheck_decision(ctx, args):
-    req = await _find_teacher_request(ctx, int(args["request_id"]))
+    req, classes = await asyncio.gather(_find_teacher_request(ctx, int(args["request_id"])), teacher_classes(ctx, {}))
     if not req:
         return {"allowed": False, "errors": ["That request is not in your classes (Rule 6.5.2)."]}
+    cls = next((c for c in classes or [] if c.get("class_code") == req.get("class_code")), None)
+    if cls is None:
+        return {"allowed": False, "errors": [f"You are not the advisor or delegated approver of {req.get('class_code')} "
+                                             "(Rule 6.5.2)."]}
+    if cls.get("valid_until") and rules.parse_date(cls["valid_until"]) < ctx.today_date:
+        return {"allowed": False, "errors": [f"Your delegated authority for {cls['class_code']} ended on "
+                                             f"{cls['valid_until']} (Rule 6.5.3 and the department delegation notice)."]}
     if req.get("status") not in ("pending", "proof_pending"):
         return {"allowed": False, "errors": [f"Request #{req['id']} is already {req.get('status')}; a request is decided only once (Rule 6.5.5)."]}
     if "reason" in args and not str(args.get("reason") or "").strip():
@@ -357,8 +369,9 @@ TOOLS: list[Tool] = [
     Tool("get_request_status", "Status of one of the student's requests.",
          _obj({"request_id": {"type": "integer"}}, ["request_id"]), {STUDENT}, get_request_status),
     Tool("check_leave_request", "Check (without submitting) whether a leave/on-duty request is allowed: exam days, "
-         "holidays, notice period, duplicates and attendance impact. Use for 'can I take leave...' questions.",
-         _obj(LEAVE_PROPS, ["type", "from_date"]), {STUDENT}, check_leave_tool),
+         "holidays, working Saturdays, notice period, duplicates and attendance impact. Use for 'can I take leave...' "
+         "questions; type defaults to personal_leave, so don't ask for it first.",
+         _obj(LEAVE_PROPS, ["from_date"]), {STUDENT}, check_leave_tool),
     Tool("submit_leave_request", "Submit a personal_leave, medical_leave or on_duty request for the logged-in student. "
          "Needs type, dates and reason; on_duty also needs event_name. The system asks the user to confirm.",
          _obj(LEAVE_PROPS, ["type", "from_date", "to_date", "reason"]), {STUDENT}, submit_leave_request, write=True,
@@ -375,7 +388,7 @@ TOOLS: list[Tool] = [
          _obj({"drive_id": {"type": "integer"}}, ["drive_id"]), {STUDENT}, register_placement, write=True,
          precheck=precheck_placement, summary=lambda a: f"register you for placement drive #{a.get('drive_id')}"),
     Tool("my_placements", "Placement drives the student has registered for.", _obj(), {STUDENT}, my_placements),
-    Tool("teacher_classes", "Classes the logged-in teacher advises or has delegated authority for.", _obj(), {TEACHER}, teacher_classes),
+    Tool("teacher_classes", "Classes the teacher advises or has delegated authority for (role_type, valid_until).", _obj(), {TEACHER}, teacher_classes),
     Tool("teacher_requests", "Leave/on-duty requests from the teacher's classes. status: pending|approved|rejected|cancelled.",
          _obj({"status": {"type": "string"}}), {TEACHER}, teacher_requests),
     Tool("class_attendance", "Attendance of every student in one of the teacher's classes.",
@@ -399,3 +412,17 @@ def tools_for_role(role: str) -> list[Tool]:
 def get_tool(name: str, role: str) -> Tool | None:
     tool = _BY_NAME.get(name)
     return tool if tool and role in tool.roles else None
+
+
+async def prefetch_user_data(ctx: ToolContext) -> None:
+    """Warm the per-user cache right after login so the first questions answer fast."""
+    jobs = [ctx.cached("pub:courses", 300, ctx.kit.courses), get_calendar(ctx, {})]
+    if ctx.role == STUDENT:
+        jobs += [ctx.cached("attendance", 30, lambda: ctx.kit.attendance(ctx.token)),
+                 ctx.cached("timetable", 300, lambda: ctx.kit.timetable(ctx.token)),
+                 ctx.cached("academics", 60, lambda: ctx.kit.academics(ctx.token)),
+                 ctx.cached("pub:drives", 60, ctx.kit.placement_drives),
+                 list_my_requests(ctx, {})]
+    elif ctx.role == TEACHER:
+        jobs.append(teacher_classes(ctx, {}))
+    await asyncio.gather(*jobs, return_exceptions=True)

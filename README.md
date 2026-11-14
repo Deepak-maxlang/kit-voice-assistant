@@ -16,7 +16,7 @@ A real-time **voice assistant for Knotopian Institute of Technology (KIT)**. App
 | Placement registration | ✅ | Eligibility checks for year, department, CGPA, arrears, deadline and seats before registering. |
 | Lesson doubts | ✅ | Retrieval over the DBMS lesson notes (US/UK spelling-normalised). |
 | Admissions on public page | ✅ | Course and fee enquiries, 12th-mark eligibility, application submit (with confirmation). No student data tools are exposed. |
-| Works if one AI service fails | ✅ | LLM: Gemini 3.1 Flash-Lite → Gemini 2.5 Flash → Groq gpt-oss-120b, with backoff, jitter and a circuit breaker. STT: Deepgram → Groq Whisper. TTS: Deepgram Aura → browser speechSynthesis. Text input is always available. |
+| Works if one AI service fails | ✅ | LLM: Gemini Flash-Lite (latest) → Gemini 3.1 Flash-Lite → Groq gpt-oss-120b, with backoff, jitter and a circuit breaker. STT: Deepgram → Groq Whisper. TTS: Deepgram Aura → browser speechSynthesis. Text input is always available. |
 | "Things may change" | ✅ | Documents are re-listed every 10 minutes, so new circulars (`is_surprise`) are indexed automatically, and a circular is ranked above the handbook. Calendar, today and requests are always read live (short cache, cleared after writes). |
 
 ## Architecture
@@ -31,7 +31,7 @@ flowchart LR
   STT -->|fallback| GW[Groq Whisper]
   API --> AG[Agent loop - max 5 steps]
   AG --> LLM{LLM chain}
-  LLM --> G1[Gemini 3.1 Flash-Lite] --> G2[Gemini 2.5 Flash] --> GQ[Groq gpt-oss-120b]
+  LLM --> G1[Gemini Flash-Lite latest] --> G2[Gemini 3.1 Flash-Lite] --> GQ[Groq gpt-oss-120b]
   AG --> T[Role-scoped tools]
   T --> R[rules.py pre-checks]
   T --> KB[Knowledge base - BM25 over PDFs]
@@ -69,8 +69,21 @@ frontend/src/     pages: Home (public), Login, Assistant, History; components/Vo
 4. Read tools run immediately. A write tool (leave, OD, cancel, placement, admission, approve or reject) is **pre-checked by `rules.py`**. If it's blocked, the LLM explains why. If it's allowed, it's parked as a *pending action*, and the assistant asks "Shall I go ahead?" The college API is only called after the user says yes.
 5. The reply is spoken (Aura mp3, or the browser voice as fallback) and saved to history.
 
+## Latency
+Typical reply text in **1.4–2.2 s**, with speech starting about **0.15–0.3 s** later:
+- Flash-Lite models with thinking turned off or minimal. Chosen by benchmark: tool selection takes 0.5–0.9 s.
+- Independent tool calls run in parallel (`asyncio.gather`), and so do the college API reads inside each rule check.
+- On login, the user's attendance, timetable, calendar, requests, academics and drives are prefetched into the cache.
+- TTS is **streamed**. The reply includes a one-time `audio_url` (`GET /api/tts/{id}`, tied to the session) that relays Deepgram Aura bytes as they're generated, so the browser starts talking before the MP3 is finished. If it fails, the browser's speechSynthesis takes over.
+
+## Live changes (circulars and notices)
+- New documents are indexed automatically. Circulars and notices are boosted in search, and their titles go into the system prompt. Precedence is **newest circular/notice > live calendar > Handbook 2026**.
+- **Exam rescheduling (Circular 15/2026):** leave checks use the live `/v1/calendar`, so the old CS304 date is no longer blocked and the rescheduled date is. Entries that aren't `active` are ignored.
+- **Working Saturdays (Circular 14/2026):** working days are Monday to Friday, plus any Saturday the calendar declares as a working day. A `follows_weekday` timetable is used to estimate how leave affects attendance. Both the leave day count and the on-duty proof deadline (3 working days, Circular 12/2026) use this.
+- **Delegated approvals (Notice CSE/2026/09, Rule 6.5.3):** the assistant answers "who approves my requests" from the notice. Teacher approve and reject actions are pre-checked against `teacher_classes` (`role_type`, `valid_until`), so an expired delegation is blocked with a clear reason. Errors from the college API are passed on as plain messages.
+
 ## API
-`POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/me`, `POST /api/voice` (multipart `audio`, `conversation_id`), `POST /api/chat` (`{message, conversation_id, speak}`), `GET /api/conversations`, `GET /api/conversations/{id}`, `GET /api/public/college`, `GET /api/health` (status of the college API, documents and each LLM/speech provider).
+`POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/me`, `POST /api/voice` (multipart `audio`, `conversation_id`), `POST /api/chat` (`{message, conversation_id, speak}`), `GET /api/conversations`, `GET /api/conversations/{id}`, `GET /api/tts/{id}` (streamed reply audio), `GET /api/public/college`, `GET /api/health` (status of the college API, documents and each LLM/speech provider).
 
 ## Run locally
 ```bash
@@ -119,7 +132,7 @@ cd backend && pytest -q
 | Layer | Primary | Fallback 1 | Fallback 2 |
 |---|---|---|---|
 | Speech-to-text | Deepgram nova-3 | Groq whisper-large-v3-turbo | Type your question |
-| LLM | Gemini 3.1 Flash-Lite | Gemini 2.5 Flash | Groq openai/gpt-oss-120b |
+| LLM | gemini-flash-lite-latest | gemini-3.1-flash-lite | Groq openai/gpt-oss-120b |
 | Text-to-speech | Deepgram Aura 2 | Browser speechSynthesis | Text on screen |
 
-Each LLM provider gets retries with exponential backoff and jitter on 429/5xx. A provider that keeps failing is skipped for 30 seconds (circuit breaker). `/api/health` shows the live status.
+Each LLM call has a hard 8-second timeout; a timeout or 429 moves straight to the next provider, and 5xx gets one retry with exponential backoff and jitter. A failing provider is skipped for 30 seconds (10 minutes for a daily-quota 429) by a circuit breaker. `/api/health` shows the live status.
