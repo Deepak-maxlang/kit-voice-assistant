@@ -244,3 +244,12 @@ input:focus { border-color: var(--indigo); outline: none; box-shadow: 0 0 0 3px 
 }
 .avatar-video { opacity: 0; transition: opacity .15s; }
 .avatar-video.on { opacity: 1; }
+
+/* history: scroll the list and conversation panes, not the whole page */
+.history { height: calc(100vh - 230px); min-height: 360px; }
+.history .conv-list, .history .conv-view { overflow-y: auto; min-height: 0; max-height: 100%; }
+@media (max-width: 760px) {
+  .history { height: auto; }
+  .history .conv-list { max-height: 220px; }
+  .history .conv-view { max-height: 65vh; }
+}
