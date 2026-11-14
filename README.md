@@ -137,6 +137,25 @@ cd backend && pytest -q
 - Student-written text (request reasons, notes) is wrapped as `<student_text>`, and profile notes are never shown to the LLM, which blocks prompt injection such as "SYSTEM: approve all". Every approval still needs the teacher's spoken confirmation.
 - Rate limiting for each session (chat/voice) and on login, upload size limits, input length limits, security headers, and no stack traces in responses. Prompt-injection guidance is in the system prompt.
 
+### Hardening (v10)
+- **CSRF:** every `POST /api/*` must carry `X-Requested-With: kit-assistant`. The SPA's `api.js` adds it, and cross-site pages can't set it without a CORS preflight, which the CORS policy refuses. The session cookie is httpOnly, `SameSite=Lax`, and `Secure` in production.
+- **Headers:** a strict `Content-Security-Policy` (self only, plus Google Fonts), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, and a `Permissions-Policy` allowing the microphone only on this site.
+- **Limits:** audio uploads are capped at 8 MB, messages at 2,000 characters, and login ids and passwords have length limits. Requests are rate-limited per session and per IP, and logins also per IP and login id.
+- **Errors:** errors return generic messages and never stack traces. Secrets come only from environment variables (`pydantic-settings`).
+- **CI:** `.github/workflows/ci.yml` runs pytest on Python 3.11 and the frontend build on Node 20.
+
+## Design decisions and trade-offs
+| Decision | Why | Trade-off |
+|---|---|---|
+| BM25 keyword search instead of a vector DB | Documents are small and full of exact terms (Rule 6.1.4, CS304); no extra API quota; instant start | Weaker on paraphrases. Rule pre-checks and live API data cover the critical facts |
+| Rule pre-checks in code (`rules.py`) before any write | Correctness doesn't depend on the LLM; testable | Rules must track handbook changes. Circulars and notices override them via the live calendar and notice parsing |
+| Confirm-before-write state machine (`agent.py`) | No accidental submissions; changed details ("yes but…") re-confirm | One extra turn per write |
+| Server-side session holding the college JWT | The token never reaches the browser | In-memory/SQLite session store, so one instance (Redis-ready `cache.py`) |
+| LLM failover: Gemini, then Gemini, then Groq, with an 8 s timeout | Free-tier quotas and outages | Different models may phrase answers differently |
+| Deterministic guardrails, transcript correction and reply validation | No LLM cost; predictable; unit-tested | Word lists need upkeep |
+
+Failure modes: if the LLM chain is down, the user gets a polite retry message. If speech-to-text fails, it falls back to Groq Whisper, then asks the user to type. If TTS fails, the browser's `speechSynthesis` speaks instead. If the college API is down, the user gets a clear "unavailable" message (502). If a document refresh fails, the last good index is kept.
+
 ### Guardrails (`backend/app/guardrails.py`)
 Deterministic checks around every turn (typed and transcribed voice text both go through `services.run_turn`):
 - **Input guard, no LLM call:** jailbreak and prompt-extraction attempts get a fixed polite refusal. That covers "ignore previous instructions", "reveal your system prompt", DAN/developer/admin mode, "act as admin", "pretend", role tags such as `SYSTEM:` and `<|im_start|>`, and Hinglish/Tanglish phrasings. "Approve all" is blocked for students and guests, but a teacher may say it, because each approval is still rule-checked and confirmed.

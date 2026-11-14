@@ -1,6 +1,9 @@
 // Thin API client. Cookies carry the session; no tokens are ever stored in the browser.
 async function request(path, options = {}) {
-  const res = await fetch(path, { credentials: 'include', ...options })
+  const method = (options.method || 'GET').toUpperCase()
+  // CSRF: the server rejects API POSTs without this custom header (cross-site pages cannot set it).
+  const headers = { ...(options.headers || {}), ...(method === 'POST' ? { 'X-Requested-With': 'kit-assistant' } : {}) }
+  const res = await fetch(path, { credentials: 'include', ...options, headers })
   let data = null
   try { data = await res.json() } catch { /* empty body */ }
   if (!res.ok) {
