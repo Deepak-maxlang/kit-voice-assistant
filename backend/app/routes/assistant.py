@@ -5,6 +5,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..routes.auth import public_user
+from ..textfix import correct_transcript
 from ..services import Services, check_rate, current_session, run_turn, services, tts_url
 
 router = APIRouter(prefix="/api", tags=["assistant"])
@@ -40,7 +41,8 @@ async def voice(request: Request, audio: UploadFile = File(...), conversation_id
     if len(data) > MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="Audio too long.")
     ctype = (audio.content_type or "audio/webm").split(";")[0]
-    transcript, stt_provider = await svc.speech.transcribe(data, ctype, audio.filename or "audio.webm")
+    raw_transcript, stt_provider = await svc.speech.transcribe(data, ctype, audio.filename or "audio.webm")
+    transcript = correct_transcript(raw_transcript)  # e.g. "the pieces for CSE" -> "the fees for CSE"
     if not transcript:
         msg = "Sorry, I couldn't hear that clearly. Could you say it again?" if stt_provider else \
             "Speech recognition is unavailable right now. Please type your question."
@@ -48,7 +50,7 @@ async def voice(request: Request, audio: UploadFile = File(...), conversation_id
                 "audio_url": tts_url(svc, current_session(request), msg) if svc.settings.deepgram_api_key else None,
                 "conversation_id": conversation_id, "actions": [], "stt_provider": stt_provider}
     result = await run_turn(svc, current_session(request), transcript, conversation_id, speak=True)
-    return {"transcript": transcript, "stt_provider": stt_provider, **result}
+    return {"transcript": transcript, "raw_transcript": raw_transcript, "stt_provider": stt_provider, **result}
 
 
 # Same text as the first chat bubble in the SPA (frontend/src/components/VoiceAssistant.jsx GREETING).

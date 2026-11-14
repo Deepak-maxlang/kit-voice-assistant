@@ -35,9 +35,7 @@ export default function History({ user }) {
           {active?.messages.map((m, i) => (
             <div key={i} className={`bubble ${m.role}`}>
               <span>{m.content}</span>
-              {m.meta?.actions?.length > 0 && (
-                <small className="actions">{m.meta.actions.map((a) => `${a.tool.replaceAll('_', ' ')}: ${a.status.replaceAll('_', ' ')}`).join(' · ')}</small>
-              )}
+              {/* tool statuses are kept in meta, not shown */}
             </div>
           ))}
         </div>

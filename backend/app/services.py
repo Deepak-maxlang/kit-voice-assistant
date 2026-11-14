@@ -11,6 +11,7 @@ from fastapi import HTTPException, Request
 import time
 
 from . import guardrails
+from .textfix import validate_reply
 from .agent import Agent
 from .cache import Cache
 from .config import Settings
@@ -140,6 +141,9 @@ async def run_turn(svc: Services, session: dict, text: str, conversation_id: str
         safe = guardrails.check_output(result["reply"], *_identifiers(ctx))
         if safe != result["reply"]:
             result = {**result, "reply": safe, "guardrail": "output_redacted"}
+        checked, problems = validate_reply(result["reply"])
+        if problems or checked != result["reply"]:
+            result = {**result, "reply": checked, "validation": problems or ["normalised"]}
 
     def persist() -> None:
         svc.store.add_message(conversation_id, "user", text)
