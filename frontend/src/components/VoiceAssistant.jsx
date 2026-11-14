@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 
 // States: idle -> recording -> thinking -> speaking -> idle (or error)
-const LABELS = { idle: 'Tap to talk', recording: 'Listening… tap to send', thinking: 'Thinking…', speaking: 'Speaking… tap to stop', error: 'Tap to try again' }
+const LABELS = { idle: 'Tap to talk', recording: 'Listening…', thinking: 'Thinking…', speaking: 'Speaking…', error: 'Tap to try again' }
 const GREETING = {
   public: 'Hello! I can help with admissions at KIT: courses, fees, eligibility and applying. What would you like to know?',
   student: 'Hi! Ask me about your attendance, timetable, leave or on-duty requests, placements, rules or DBMS doubts.',
@@ -15,6 +15,7 @@ const CHIPS = {
 }
 const SILENCE_MS = 1300
 const MAX_RECORD_MS = 20000
+const DEMO_STATES = new Set(['idle', 'recording', 'thinking', 'speaking', 'error'])
 
 function speakWithBrowser(text, onEnd) {
   if (!('speechSynthesis' in window)) return onEnd()
@@ -26,17 +27,52 @@ function speakWithBrowser(text, onEnd) {
   window.speechSynthesis.speak(u)
 }
 
+function rmsFromAnalyser(analyser, buf) {
+  analyser.getByteTimeDomainData(buf)
+  let sum = 0
+  for (const v of buf) sum += ((v - 128) / 128) ** 2
+  return Math.sqrt(sum / buf.length)
+}
+
+function AssistantOrb({ status, level, onClick, disabled, label }) {
+  return (
+    <button
+      type="button"
+      className={`orb ${status}`}
+      style={{ '--level': Math.max(0, Math.min(1, level || 0)) }}
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+    >
+      <span className="orb-rings" aria-hidden="true"><i /><i /><i /></span>
+      <span className="orb-core" aria-hidden="true">
+        <span className="orb-highlight" />
+        <span className="orb-shimmer" />
+      </span>
+      <span className="orb-orbit" aria-hidden="true"><i /><i /><i /></span>
+    </button>
+  )
+}
+
 export default function VoiceAssistant({ mode = 'public' }) {
   const [status, setStatus] = useState('idle')
   const [messages, setMessages] = useState([{ role: 'assistant', content: GREETING[mode] || GREETING.public }])
   const [conversationId, setConversationId] = useState(null)
   const [text, setText] = useState('')
   const [error, setError] = useState('')
+  const [level, setLevel] = useState(0)
+  const [demo, setDemo] = useState(null)
   const recorderRef = useRef(null)
   const audioRef = useRef(null)
   const vadRef = useRef(null)
+  const playbackRef = useRef(null)
   const endRef = useRef(null)
   const [seconds, setSeconds] = useState(0)
+
+  useEffect(() => {
+    const v = new URLSearchParams(window.location.search).get('orb')
+    if (DEMO_STATES.has(v)) setDemo(v)
+  }, [])
 
   useEffect(() => {
     if (status !== 'recording') return undefined
@@ -45,30 +81,61 @@ export default function VoiceAssistant({ mode = 'public' }) {
     return () => clearInterval(t)
   }, [status])
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, status])
+  useEffect(() => { const box = endRef.current?.parentElement; if (box) box.scrollTop = box.scrollHeight }, [messages, status])
   useEffect(() => () => stopEverything(), [])
+
+  function stopLevelWatch() {
+    if (playbackRef.current) { playbackRef.current.stop(); playbackRef.current = null }
+    setLevel(0)
+  }
 
   function stopEverything() {
     if (vadRef.current) { vadRef.current.stop(); vadRef.current = null }
     if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
     audioRef.current?.pause()
     window.speechSynthesis?.cancel()
+    stopLevelWatch()
+  }
+
+  function watchAnalyser(analyser, ctx, scale = 4) {
+    const buf = new Uint8Array(analyser.fftSize)
+    const timer = setInterval(() => {
+      setLevel(Math.min(1, rmsFromAnalyser(analyser, buf) * scale))
+    }, 80)
+    return { stop() { clearInterval(timer); setLevel(0); ctx.close().catch(() => {}) } }
+  }
+
+  function watchPlayback(audio) {
+    const Ctx = window.AudioContext || window.webkitAudioContext
+    if (!Ctx) return { stop() {} }
+    try {
+      const ctx = new Ctx()
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 1024
+      const src = ctx.createMediaElementSource(audio)
+      src.connect(analyser)
+      analyser.connect(ctx.destination)
+      ctx.resume().catch(() => {})
+      return watchAnalyser(analyser, ctx, 5)
+    } catch {
+      return { stop() { setLevel(0) } }
+    }
   }
 
   function playReply(data) {
-    const done = () => setStatus('idle')
+    const done = () => { stopLevelWatch(); setStatus('idle') }
     setStatus('speaking')
     const src = data.audio_url || (data.audio_b64 ? `data:audio/mpeg;base64,${data.audio_b64}` : null)
     if (src) {
-      // audio_url streams from the server, so playback starts before the whole MP3 is generated
       const audio = new Audio(src)
       let fellBack = false
-      audio.onerror = () => { if (!fellBack) { fellBack = true; speakWithBrowser(data.reply, done) } }
+      audio.onerror = () => { if (!fellBack) { fellBack = true; stopLevelWatch(); speakWithBrowser(data.reply, done) } }
       audioRef.current = audio
       audio.onended = done
-      audio.play().catch(() => { if (!fellBack) { fellBack = true; speakWithBrowser(data.reply, done) } })
+      playbackRef.current = watchPlayback(audio)
+      audio.play().catch(() => { if (!fellBack) { fellBack = true; stopLevelWatch(); speakWithBrowser(data.reply, done) } })
     } else {
-      speakWithBrowser(data.reply, done) // TTS fallback when the speech service is down
+      speakWithBrowser(data.reply, done)
     }
   }
 
@@ -84,6 +151,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
 
   async function sendAudio(blob) {
     setStatus('thinking')
+    stopLevelWatch()
     try {
       handleResult(await api.voice(blob, conversationId))
     } catch (e) {
@@ -121,15 +189,13 @@ export default function VoiceAssistant({ mode = 'public' }) {
     let silentSince = performance.now()
     const started = performance.now()
     const timer = setInterval(() => {
-      analyser.getByteTimeDomainData(buf)
-      let sum = 0
-      for (const v of buf) sum += ((v - 128) / 128) ** 2
-      const rms = Math.sqrt(sum / buf.length)
+      const rms = rmsFromAnalyser(analyser, buf)
+      setLevel(Math.min(1, rms * 6))
       const now = performance.now()
       if (rms > 0.04) { heardSpeech = true; silentSince = now }
       if ((heardSpeech && now - silentSince > SILENCE_MS) || now - started > MAX_RECORD_MS) onSilence()
     }, 100)
-    return { stop() { clearInterval(timer); ctx.close().catch(() => {}) } }
+    return { stop() { clearInterval(timer); setLevel(0); ctx.close().catch(() => {}) } }
   }
 
   async function startRecording() {
@@ -157,13 +223,15 @@ export default function VoiceAssistant({ mode = 'public' }) {
     }
   }
 
-  function onMicClick() {
+  function onOrbClick() {
     if (status === 'recording') recorderRef.current?.stop()
     else if (status === 'speaking') { stopEverything(); setStatus('idle') }
     else if (status !== 'thinking') { stopEverything(); startRecording() }
   }
 
-  const busy = status === 'thinking'
+  const viewStatus = demo || status
+  const busy = status === 'thinking' || viewStatus === 'thinking'
+  const label = LABELS[viewStatus]
   return (
     <div className="assistant panel" aria-label="Voice assistant">
       <div className="assistant-head">
@@ -189,16 +257,13 @@ export default function VoiceAssistant({ mode = 'public' }) {
         ))}
       </div>
 
-      <div className="controls">
-        <button className={`mic ${status}`} onClick={onMicClick} disabled={busy} aria-label={LABELS[status]}>
-          {status === 'thinking' ? <span className="spinner light" /> :
-            status === 'speaking' ? <span className="eq" aria-hidden="true"><i /><i /><i /><i /></span> :
-              status === 'recording' ? <span className="stop" aria-hidden="true" /> : <span aria-hidden="true">🎤</span>}
-        </button>
-        <div className="status" role="status">
-          <b>{LABELS[status]}</b>
-          {status === 'recording' && <span className="timer">0:{String(seconds).padStart(2, '0')}</span>}
-          <small className="muted">{status === 'recording' ? 'Stops automatically when you pause' : 'Speech-to-text by Deepgram'}</small>
+      <div className="orb-block">
+        <AssistantOrb status={viewStatus} level={demo ? 0.45 : level} onClick={onOrbClick} disabled={status === 'thinking'} label={label} />
+        <div className="orb-caption" role="status">
+          <b>{label}</b>
+          {viewStatus === 'recording' && <span className="timer">0:{String(seconds).padStart(2, '0')}</span>}
+          {viewStatus === 'recording' && <small className="muted">Stops automatically when you pause</small>}
+          {viewStatus === 'speaking' && <small className="muted">Tap to stop</small>}
         </div>
       </div>
       {error && <p className="error" role="alert">{error}</p>}
