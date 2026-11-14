@@ -67,12 +67,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="KIT Voice Assistant", version="1.0.0", lifespan=lifespan)
 _settings = get_settings()
 app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _settings.cors_origins.split(",") if o.strip()],
-                   allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+                   allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-Requested-With"])
 
 
 @app.middleware("http")
 async def session_and_security(request: Request, call_next):
     created = False
+    # CSRF defence for cookie-authenticated writes: browsers cannot send a custom header cross-site without
+    # a CORS preflight (which our CORS policy refuses for foreign origins), so require it on every API POST.
+    if request.method == "POST" and request.url.path.startswith("/api") and \
+            request.headers.get("x-requested-with") != "kit-assistant":
+        return JSONResponse({"detail": "Missing or invalid X-Requested-With header."}, status_code=403)
     if request.url.path.startswith("/api"):
         svc: Services = request.app.state.services
         request.state.session, created = load_session(request, svc.store, svc.settings)
@@ -87,6 +92,10 @@ async def session_and_security(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Permissions-Policy"] = "microphone=(self)"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: blob:; "
+        "media-src 'self' data: blob:; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com; object-src 'none'; "
+        "base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
     return response
 
 
