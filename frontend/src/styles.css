@@ -242,3 +242,5 @@ input:focus { border-color: var(--indigo); outline: none; box-shadow: 0 0 0 3px 
   .orb.thinking .orb-orbit i { opacity: 1; }
   .orb.thinking .orb-shimmer { opacity: .35; }
 }
+.avatar-video { opacity: 0; transition: opacity .15s; }
+.avatar-video.on { opacity: 1; }
