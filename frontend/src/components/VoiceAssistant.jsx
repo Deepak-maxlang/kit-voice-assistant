@@ -68,6 +68,8 @@ export default function VoiceAssistant({ mode = 'public' }) {
   const vadRef = useRef(null)
   const playbackRef = useRef(null)
   const endRef = useRef(null)
+  const panelRef = useRef(null)
+  const welcomedRef = useRef(false)
   const [seconds, setSeconds] = useState(0)
 
   useEffect(() => {
@@ -84,6 +86,40 @@ export default function VoiceAssistant({ mode = 'public' }) {
 
   useEffect(() => { const box = endRef.current?.parentElement; if (box) box.scrollTop = box.scrollHeight }, [messages, status])
   useEffect(() => () => stopEverything(), [])
+
+  // Spoken welcome: once per page load, when the panel scrolls into view. Browsers block audio until the
+  // user interacts, so if play() is refused we queue it for the first click/tap/key anywhere on the page.
+  useEffect(() => {
+    const el = panelRef.current
+    if (!el || welcomedRef.current) return undefined
+    let cleanupGesture = () => {}
+    const greet = () => {
+      if (welcomedRef.current) return
+      welcomedRef.current = true
+      const audio = new Audio(`/api/welcome-audio?mode=${encodeURIComponent(mode)}`)
+      const done = () => { setStatus((s) => (s === 'speaking' ? 'idle' : s)); stopLevelWatch() }
+      audio.onended = done
+      audio.onerror = done
+      audioRef.current = audio
+      audio.play().then(() => setStatus('speaking')).catch(() => {
+        welcomedRef.current = false // autoplay blocked: wait for the first user gesture
+        const onGesture = (e) => {
+          cleanupGesture()
+          // If the first tap is the talk button, the user wants to speak, not hear the greeting.
+          if (e.target?.closest?.('.dock-orb, .status-btn, form')) { welcomedRef.current = true; return }
+          greet()
+        }
+        const evs = ['pointerdown', 'keydown']
+        evs.forEach((ev) => document.addEventListener(ev, onGesture, { capture: true }))
+        cleanupGesture = () => evs.forEach((ev) => document.removeEventListener(ev, onGesture, { capture: true }))
+      })
+    }
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((en) => en.isIntersecting)) { io.disconnect(); greet() }
+    }, { threshold: 0.4 })
+    io.observe(el)
+    return () => { io.disconnect(); cleanupGesture() }
+  }, [mode])
 
   function stopLevelWatch() {
     if (playbackRef.current) { playbackRef.current.stop(); playbackRef.current = null }
@@ -219,7 +255,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
       vadRef.current = startSilenceDetection(stream, () => recorder.state === 'recording' && recorder.stop())
       setStatus('recording')
     } catch (e) {
-      setError('Microphone not available. Please allow mic access or type your question.')
+      setError('Microphone is blocked. Allow the microphone in the address bar, or type below.')
       setStatus('error')
     }
   }
@@ -234,7 +270,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
   const busy = status === 'thinking' || viewStatus === 'thinking'
   const label = LABELS[viewStatus]
   return (
-    <div className="assistant panel" aria-label="Voice assistant">
+    <div className="assistant panel" aria-label="Voice assistant" ref={panelRef}>
       <div className="assistant-head">
         <span className="dot" aria-hidden="true" /> <b>KIT Assistant</b>
         <span className="muted small">{mode === 'public' ? 'Admissions help' : `${mode} services`}</span>
@@ -268,14 +304,13 @@ export default function VoiceAssistant({ mode = 'public' }) {
             label={label}
             fallback={<AssistantOrb status={viewStatus} level={demo ? 0.45 : level} onClick={onOrbClick} disabled={status === 'thinking'} label={label} />}
           />
-        </div>
-        <div className="dock-main">
-          <div className="orb-caption" role="status">
+          <button type="button" className={`status-btn ${viewStatus}`} onClick={onOrbClick} disabled={status === 'thinking'} role="status">
             <b>{label}</b>
             {viewStatus === 'recording' && <span className="timer">0:{String(seconds).padStart(2, '0')}</span>}
-            {viewStatus === 'recording' && <small className="muted">stops when you pause</small>}
             {viewStatus === 'speaking' && <small className="muted">tap to stop</small>}
-          </div>
+          </button>
+        </div>
+        <div className="dock-main">
           <form className="text-input" onSubmit={sendText}>
             <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Or type your question…" maxLength={2000} aria-label="Type your question" />
             <button className="btn-primary" disabled={!text.trim() || busy}>Send</button>

@@ -103,3 +103,11 @@ def test_rate_limit_not_bypassed_by_fresh_sessions():
             check_rate(lim, _req(f"s{i}"), subject="arjun")
     assert e.value.status_code == 429 and i == 8
     check_rate(lim, _req("other", ip="5.6.7.8"), subject="arjun")  # other IPs unaffected
+
+
+def test_greetings_match_frontend():
+    import pathlib, re
+    from app.routes.assistant import GREETINGS
+    jsx = (pathlib.Path(__file__).parents[2] / "frontend/src/components/VoiceAssistant.jsx").read_text()
+    for mode, text in GREETINGS.items():
+        assert re.search(rf"{mode}: '{re.escape(text)}'", jsx), mode
