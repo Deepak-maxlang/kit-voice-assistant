@@ -8,6 +8,9 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
+import time
+
+from . import guardrails
 from .agent import Agent
 from .cache import Cache
 from .config import Settings
@@ -105,19 +108,44 @@ def tts_url(svc: Services, session: dict, text: str) -> str:
     return f"/api/tts/{tts_id}"
 
 
+# Test-account identifiers: a reply naming another person's login id is treated as a leak (best effort; teachers
+# legitimately see their class, so for them only the student's own-data rule in the prompt applies).
+KNOWN_LOGINS = {"arjun", "priya", "kavya", "rahul", "karthik", "meena", "divya", "sneha", "vikram"}
+
+
+def _identifiers(ctx) -> tuple[set[str], set[str]]:
+    if ctx.role != "student":
+        return set(), set()
+    u = ctx.user or {}
+    own = {str(u.get("login_id") or ""), *(str(u.get("full_name") or "").split())}
+    return own, KNOWN_LOGINS
+
+
 async def run_turn(svc: Services, session: dict, text: str, conversation_id: str | None, speak: bool) -> dict[str, Any]:
     owner = owner_key(session)
     ctx = await tool_context(svc, session)
     conv = svc.store.get_conversation(conversation_id, owner) if conversation_id else None
     if not conv:
         conversation_id = svc.store.create_conversation(owner, ctx.role, text)
-    result = await svc.agent.handle(ctx, conversation_id, text)
+    now = time.time()
+    verdict = guardrails.check_input(text, ctx.role)
+    if guardrails.cooling_down(svc.cache, session["sid"], now):
+        result = {"reply": guardrails.COOLDOWN_REPLY, "actions": [], "provider": None, "guardrail": "cooldown"}
+    elif verdict.blocked:  # answered without any LLM call
+        cooled = guardrails.strike(svc.cache, session["sid"], now)
+        result = {"reply": guardrails.COOLDOWN_REPLY if cooled else verdict.reply, "actions": [], "provider": None,
+                  "guardrail": verdict.kind}
+    else:
+        result = await svc.agent.handle(ctx, conversation_id, text)
+        safe = guardrails.check_output(result["reply"], *_identifiers(ctx))
+        if safe != result["reply"]:
+            result = {**result, "reply": safe, "guardrail": "output_redacted"}
 
     def persist() -> None:
         svc.store.add_message(conversation_id, "user", text)
         svc.store.add_message(conversation_id, "assistant", result["reply"],
                               {"actions": [{k: v for k, v in a.items() if k != "result"} for a in result["actions"]],
-                               "provider": result.get("provider")})
+                               "provider": result.get("provider"), "guardrail": result.get("guardrail")})
 
     await asyncio.to_thread(persist)
     # Don't wait for the whole MP3: hand back a one-time URL that streams Deepgram audio as it is generated,
@@ -125,4 +153,4 @@ async def run_turn(svc: Services, session: dict, text: str, conversation_id: str
     audio_url = tts_url(svc, session, result["reply"]) if speak and svc.settings.deepgram_api_key else None
     return {"conversation_id": conversation_id, "reply": result["reply"], "audio_b64": None, "audio_url": audio_url,
             "actions": [{k: v for k, v in a.items() if k != "result"} for a in result["actions"]],
-            "provider": result.get("provider")}
+            "provider": result.get("provider"), "guardrail": result.get("guardrail")}

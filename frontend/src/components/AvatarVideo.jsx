@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 // Optional talking avatar. Drop these files into frontend/public/avatar/ to enable it:
-//   welcome.mp4 (plays once when the assistant opens), speaking.mp4 (loops while the reply is spoken),
+//   speaking.mp4 (loops only while reply audio is audible), welcome.mp4 (kept for future use),
 //   idle.jpg (poster, shown otherwise). All silent; videos are muted + playsInline so they autoplay on mobile.
 // If any file is missing, `fallback` (the animated orb) is rendered instead.
 const FILES = { welcome: '/avatar/welcome.mp4', speaking: '/avatar/speaking.mp4', idle: '/avatar/idle.jpg' }
@@ -19,15 +19,14 @@ async function exists(url, kind) {
 
 export function avatarAvailable() {
   if (!probe) {
-    probe = Promise.all([exists(FILES.welcome, 'video'), exists(FILES.speaking, 'video'), exists(FILES.idle, 'image')])
+    probe = Promise.all([exists(FILES.speaking, 'video'), exists(FILES.idle, 'image')])
       .then((r) => r.every(Boolean))
   }
   return probe
 }
 
-export default function AvatarVideo({ status, onClick, disabled, label, fallback }) {
+export default function AvatarVideo({ status, talking, onClick, disabled, label, fallback }) {
   const [ready, setReady] = useState(false)
-  const [welcomed, setWelcomed] = useState(false)
   const videoRef = useRef(null)
 
   useEffect(() => {
@@ -36,14 +35,13 @@ export default function AvatarVideo({ status, onClick, disabled, label, fallback
     return () => { alive = false }
   }, [])
 
-  useEffect(() => { if (status !== 'idle') setWelcomed(true) }, [status])
-
-  const clip = status === 'speaking' ? 'speaking' : !welcomed ? 'welcome' : null
-
+  // Idle still by default. The talking clip runs ONLY while reply/welcome audio is audibly playing
+  // (`talking` follows the audio element's playing/pause/ended/error events), so it never lip-syncs silently.
   useEffect(() => {
     const v = videoRef.current
-    if (v && clip) { v.currentTime = 0; v.play().catch(() => {}) }
-  }, [clip, ready])
+    if (!v) return
+    if (talking) { v.currentTime = 0; v.play().catch(() => {}) } else { v.pause(); v.currentTime = 0 }
+  }, [talking, ready])
 
   // Listening/thinking keep the animated orb (clear state feedback); the avatar is the face for idle/speaking.
   if (!ready || status === 'recording' || status === 'thinking') return fallback
@@ -51,23 +49,17 @@ export default function AvatarVideo({ status, onClick, disabled, label, fallback
   return (
     <button type="button" className={`avatar ${status}`} onClick={onClick} disabled={disabled} aria-label={label}>
       <img className="avatar-media" src={FILES.idle} alt="" aria-hidden="true" />
-      {clip && (
-        <video
-          key={clip}
-          ref={videoRef}
-          className="avatar-media"
-          poster={FILES.idle}
-          src={FILES[clip]}
-          muted
-          playsInline
-          autoPlay
-          loop={clip === 'speaking'}
-          preload="auto"
-          aria-hidden="true"
-          onEnded={() => clip === 'welcome' && setWelcomed(true)}
-          onError={() => setWelcomed(true)}
-        />
-      )}
+      <video
+        ref={videoRef}
+        className={`avatar-media avatar-video ${talking ? 'on' : ''}`}
+        src={FILES.speaking}
+        poster={FILES.idle}
+        muted
+        playsInline
+        loop
+        preload="auto"
+        aria-hidden="true"
+      />
       <span className="avatar-ring" aria-hidden="true" />
     </button>
   )

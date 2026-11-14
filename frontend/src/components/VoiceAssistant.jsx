@@ -18,10 +18,11 @@ const SILENCE_MS = 1300
 const MAX_RECORD_MS = 20000
 const DEMO_STATES = new Set(['idle', 'recording', 'thinking', 'speaking', 'error'])
 
-function speakWithBrowser(text, onEnd) {
+function speakWithBrowser(text, onEnd, onStart) {
   if (!('speechSynthesis' in window)) return onEnd()
   const u = new SpeechSynthesisUtterance(text)
   u.lang = 'en-IN'
+  if (onStart) u.onstart = onStart
   u.onend = onEnd
   u.onerror = onEnd
   window.speechSynthesis.cancel()
@@ -62,6 +63,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
   const [text, setText] = useState('')
   const [error, setError] = useState('')
   const [level, setLevel] = useState(0)
+  const [talking, setTalking] = useState(false) // true only while reply audio is actually audible
   const [demo, setDemo] = useState(null)
   const recorderRef = useRef(null)
   const audioRef = useRef(null)
@@ -97,11 +99,14 @@ export default function VoiceAssistant({ mode = 'public' }) {
       if (welcomedRef.current) return
       welcomedRef.current = true
       const audio = new Audio(`/api/welcome-audio?mode=${encodeURIComponent(mode)}`)
-      const done = () => { setStatus((s) => (s === 'speaking' ? 'idle' : s)); stopLevelWatch() }
+      const done = () => { setTalking(false); setStatus((s) => (s === 'speaking' ? 'idle' : s)); stopLevelWatch() }
       audio.onended = done
       audio.onerror = done
+      audio.onpause = done
+      // The avatar animates only once sound is really coming out (never a silent lip-sync).
+      audio.onplaying = () => { setTalking(true); setStatus('speaking') }
       audioRef.current = audio
-      audio.play().then(() => setStatus('speaking')).catch(() => {
+      audio.play().catch(() => {
         welcomedRef.current = false // autoplay blocked: wait for the first user gesture
         const onGesture = (e) => {
           cleanupGesture()
@@ -132,6 +137,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
     audioRef.current?.pause()
     window.speechSynthesis?.cancel()
     stopLevelWatch()
+    setTalking(false)
   }
 
   function watchAnalyser(analyser, ctx, scale = 4) {
@@ -160,19 +166,23 @@ export default function VoiceAssistant({ mode = 'public' }) {
   }
 
   function playReply(data) {
-    const done = () => { stopLevelWatch(); setStatus('idle') }
+    const done = () => { stopLevelWatch(); setTalking(false); setStatus('idle') }
+    const browser = () => speakWithBrowser(data.reply, done, () => setTalking(true))
     setStatus('speaking')
     const src = data.audio_url || (data.audio_b64 ? `data:audio/mpeg;base64,${data.audio_b64}` : null)
     if (src) {
       const audio = new Audio(src)
       let fellBack = false
-      audio.onerror = () => { if (!fellBack) { fellBack = true; stopLevelWatch(); speakWithBrowser(data.reply, done) } }
+      const fallBack = () => { if (!fellBack) { fellBack = true; stopLevelWatch(); setTalking(false); browser() } }
+      audio.onerror = fallBack
       audioRef.current = audio
+      audio.onplaying = () => setTalking(true)
+      audio.onpause = () => setTalking(false)
       audio.onended = done
       playbackRef.current = watchPlayback(audio)
-      audio.play().catch(() => { if (!fellBack) { fellBack = true; stopLevelWatch(); speakWithBrowser(data.reply, done) } })
+      audio.play().catch(fallBack)
     } else {
-      speakWithBrowser(data.reply, done)
+      browser()
     }
   }
 
@@ -299,6 +309,7 @@ export default function VoiceAssistant({ mode = 'public' }) {
         <div className="dock-orb">
           <AvatarVideo
             status={viewStatus}
+            talking={talking}
             onClick={onOrbClick}
             disabled={status === 'thinking'}
             label={label}
