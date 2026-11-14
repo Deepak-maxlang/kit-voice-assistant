@@ -26,7 +26,7 @@ def public_user(user: dict | None) -> dict | None:
 
 @router.post("/login")
 async def login(body: LoginBody, request: Request, response: Response, svc: Services = Depends(services)):
-    check_rate(svc.login_limiter, request)
+    check_rate(svc.login_limiter, request, subject=body.login_id.strip())
     try:
         data = await svc.kit.login(body.login_id.strip(), body.password)
         token = data["access_token"]

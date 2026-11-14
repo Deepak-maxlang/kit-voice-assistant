@@ -8,8 +8,9 @@ the rules, then held as a *pending action* until the user confirms.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 
 from . import rules
@@ -65,6 +66,21 @@ class Tool:
 
     def schema(self) -> dict:
         return {"name": self.name, "description": self.description, "parameters": self.parameters}
+
+
+def spoken_date(value) -> str:
+    """'2026-11-24' -> '24 November' (replies are spoken aloud)."""
+    try:
+        d = rules.parse_date(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{d.day} {d.strftime('%B')}"
+
+
+def spoken_range(start, end=None) -> str:
+    if not end or str(end)[:10] == str(start)[:10]:
+        return f"on {spoken_date(start)}"
+    return f"from {spoken_date(start)} to {spoken_date(end)}"
 
 
 def _obj(props: dict | None = None, required: list[str] | None = None) -> dict:
@@ -275,8 +291,46 @@ async def my_placements(ctx, args):
 
 
 # ------------------------------------------------------------------ teacher handlers
+_VALID = re.compile(r"Valid:\s*(\d{1,2} [A-Za-z]+ \d{4})\s+to\s+(\d{1,2} [A-Za-z]+ \d{4})")
+
+
+def delegation_window(kb, class_code: str) -> tuple[date, date, str] | None:
+    """(start, end, title) of the newest department delegation notice for ``class_code``, if any.
+
+    The notice is the newer, authoritative source (precedence: circular/notice > live system), so an
+    approver's delegated authority ends on the notice's end date even if the college API still lists it.
+    """
+    best = None
+    for ch in getattr(kb, "chunks", None) or []:
+        if "delegation" not in (ch.title or "").lower() or class_code not in f"{ch.title} {ch.text}":
+            continue
+        m = _VALID.search(ch.text)
+        if not m:
+            continue
+        try:
+            start, end = (datetime.strptime(x, "%d %B %Y").date() for x in m.groups())
+        except ValueError:
+            continue
+        if best is None or start > best[0]:
+            best = (start, end, ch.title)
+    return best
+
+
 async def teacher_classes(ctx, args):
-    return await ctx.cached("tclasses", 60, lambda: ctx.kit.teacher_classes(ctx.token))
+    classes = await ctx.cached("tclasses", 60, lambda: ctx.kit.teacher_classes(ctx.token))
+    out = []
+    for c in classes or []:
+        c = dict(c)
+        win = delegation_window(ctx.kb, c.get("class_code", "")) if c.get("role_type") == "delegated" else None
+        if win:
+            api_end = rules.parse_date(c["valid_until"]) if c.get("valid_until") else None
+            if api_end is None or win[1] < api_end:
+                c["valid_until"] = win[1].isoformat()
+                c["valid_until_source"] = win[2]
+        if c.get("valid_until") and rules.parse_date(c["valid_until"]) < ctx.today_date:
+            c["authority_expired"] = True
+        out.append(c)
+    return out
 
 
 def _mark_untrusted(req: dict) -> dict:
@@ -323,8 +377,9 @@ async def precheck_decision(ctx, args):
         return {"allowed": False, "errors": [f"You are not the advisor or delegated approver of {req.get('class_code')} "
                                              "(Rule 6.5.2)."]}
     if cls.get("valid_until") and rules.parse_date(cls["valid_until"]) < ctx.today_date:
+        src = cls.get("valid_until_source") or "the department delegation notice"
         return {"allowed": False, "errors": [f"Your delegated authority for {cls['class_code']} ended on "
-                                             f"{cls['valid_until']} (Rule 6.5.3 and the department delegation notice)."]}
+                                             f"{cls['valid_until']} ({src}, Rule 6.5.3); the class advisor decides now."]}
     if req.get("status") not in ("pending", "proof_pending"):
         return {"allowed": False, "errors": [f"Request #{req['id']} is already {req.get('status')}; a request is decided only once (Rule 6.5.5)."]}
     if "reason" in args and not str(args.get("reason") or "").strip():
@@ -337,7 +392,7 @@ async def precheck_decision(ctx, args):
                 warnings.append("The request covers an internal assessment day (Rule 6.1.4).")
         except KitError:
             pass
-    args["student"] = f"{req.get('student_name')}'s {str(req.get('type', '')).replace('_', ' ')} for {req.get('from_date')}"
+    args["student"] = f"{req.get('student_name')}'s {str(req.get('type', '')).replace('_', ' ')} {spoken_range(req.get('from_date'), req.get('to_date'))}"
     return {"allowed": True, "warnings": warnings, "request": req}
 
 
@@ -389,7 +444,7 @@ TOOLS: list[Tool] = [
     Tool("get_timetable", "Logged-in student's weekly timetable. weekday 1=Mon..7=Sun.",
          _obj({"weekday": {"type": "integer"}}), {STUDENT}, get_timetable),
     Tool("get_subjects", "Logged-in student's subjects.", _obj(), {STUDENT}, get_subjects),
-    Tool("get_calendar", "Academic calendar events (holidays, internal exams) between two dates.",
+    Tool("get_calendar", "Live academic calendar (holidays, internal exams, working Saturdays) between two dates. Authoritative for exam dates: it already applies rescheduling circulars.",
          _obj({"from_date": DATE, "to_date": DATE}), LOGGED, get_calendar),
     Tool("list_my_requests", "Logged-in student's leave/on-duty requests and their status.", _obj(), {STUDENT}, list_my_requests),
     Tool("get_request_status", "Status of one of the student's requests.",
@@ -402,8 +457,8 @@ TOOLS: list[Tool] = [
          "Needs type, dates and reason; on_duty also needs event_name. The system asks the user to confirm.",
          _obj(LEAVE_PROPS, ["type", "from_date", "to_date", "reason"]), {STUDENT}, submit_leave_request, write=True,
          precheck=check_leave_request,
-         summary=lambda a: f"submit {a.get('type', '').replace('_', ' ')} from {a.get('from_date')} to "
-                           f"{a.get('to_date') or a.get('from_date')}{' (half day)' if a.get('half_day') else ''}"
+         summary=lambda a: f"submit {a.get('type', '').replace('_', ' ')} {spoken_range(a.get('from_date'), a.get('to_date'))}"
+                           f"{' (half day)' if a.get('half_day') else ''}"
                            f" for '{a.get('reason')}'" + (f", event '{a['event_name']}'" if a.get("event_name") else "")),
     Tool("cancel_request", "Cancel one of the student's pending/approved requests.",
          _obj({"request_id": {"type": "integer"}}, ["request_id"]), {STUDENT}, cancel_request, write=True,

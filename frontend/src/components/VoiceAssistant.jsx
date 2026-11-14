@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
+import AvatarVideo from './AvatarVideo.jsx'
 
 // States: idle -> recording -> thinking -> speaking -> idle (or error)
 const LABELS = { idle: 'Tap to talk', recording: 'Listening…', thinking: 'Thinking…', speaking: 'Speaking…', error: 'Tap to try again' }
@@ -257,20 +258,30 @@ export default function VoiceAssistant({ mode = 'public' }) {
         ))}
       </div>
 
-      <div className="orb-block">
-        <AssistantOrb status={viewStatus} level={demo ? 0.45 : level} onClick={onOrbClick} disabled={status === 'thinking'} label={label} />
-        <div className="orb-caption" role="status">
-          <b>{label}</b>
-          {viewStatus === 'recording' && <span className="timer">0:{String(seconds).padStart(2, '0')}</span>}
-          {viewStatus === 'recording' && <small className="muted">Stops automatically when you pause</small>}
-          {viewStatus === 'speaking' && <small className="muted">Tap to stop</small>}
+      {error && <p className="error" role="alert">{error}</p>}
+      <div className="dock">
+        <div className="dock-orb">
+          <AvatarVideo
+            status={viewStatus}
+            onClick={onOrbClick}
+            disabled={status === 'thinking'}
+            label={label}
+            fallback={<AssistantOrb status={viewStatus} level={demo ? 0.45 : level} onClick={onOrbClick} disabled={status === 'thinking'} label={label} />}
+          />
+        </div>
+        <div className="dock-main">
+          <div className="orb-caption" role="status">
+            <b>{label}</b>
+            {viewStatus === 'recording' && <span className="timer">0:{String(seconds).padStart(2, '0')}</span>}
+            {viewStatus === 'recording' && <small className="muted">stops when you pause</small>}
+            {viewStatus === 'speaking' && <small className="muted">tap to stop</small>}
+          </div>
+          <form className="text-input" onSubmit={sendText}>
+            <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Or type your question…" maxLength={2000} aria-label="Type your question" />
+            <button className="btn-primary" disabled={!text.trim() || busy}>Send</button>
+          </form>
         </div>
       </div>
-      {error && <p className="error" role="alert">{error}</p>}
-      <form className="text-input" onSubmit={sendText}>
-        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Or type your question…" maxLength={2000} aria-label="Type your question" />
-        <button className="btn-primary" disabled={!text.trim() || busy}>Send</button>
-      </form>
     </div>
   )
 }
