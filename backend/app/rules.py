@@ -149,11 +149,15 @@ def check_leave_request(req: dict, today: date, calendar_events: list[dict],
     if rtype != "on_duty" and attendance and working:
         proj = project_attendance(attendance, timetable or [], working, calendar_events)
         r.info["attendance_projection"] = proj
+        rule = 'Rule 5.1.1' if minimum > MIN_ATTENDANCE else 'Chapter 4'
         if proj and proj["projected_percentage"] < minimum:
-            r.warnings.append(
-                f"This leave would bring your attendance from {proj['current_percentage']}% to about "
-                f"{proj['projected_percentage']}%, below the {minimum:g}% minimum "
-                f"({'Rule 5.1.1' if minimum > MIN_ATTENDANCE else 'Chapter 4'}).")
+            if proj["projected_percentage"] >= proj["current_percentage"]:
+                r.warnings.append(f"Your attendance is already {proj['current_percentage']:g}%, below the {minimum:g}% "
+                                  f"minimum ({rule}); avoid further absences.")
+            else:
+                r.warnings.append(
+                    f"This leave would bring your attendance from {proj['current_percentage']:g}% to about "
+                    f"{proj['projected_percentage']:g}%, below the {minimum:g}% minimum ({rule}).")
     r.info["working_days"] = [d.isoformat() for d in working]
     r.info["calendar_used"] = [{"date": e.get("date"), "type": e.get("type"), "title": e.get("title")}
                                for e in calendar_events if e.get("status", "active") == "active"]

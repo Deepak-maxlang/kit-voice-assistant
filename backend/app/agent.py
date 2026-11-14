@@ -26,8 +26,16 @@ _NO = re.compile(r"^\s*(no|nope|nah|cancel|don'?t|do not|stop|wait|not now|never
 MAX_TOOL_RESULT = 6000
 
 
+_CHANGE = re.compile(r"\b(but|change|instead|actually|except|make it|wait|not|different|another)\b", re.I)
+
+
 def is_yes(text: str) -> bool:
     return bool(_YES.match(text)) and not _NO.match(text)
+
+
+def is_plain_yes(text: str) -> bool:
+    """A bare confirmation ("yes", "ok go ahead") with no change of details ("yes but make it the 25th")."""
+    return is_yes(text) and len(text.split()) <= 5 and not _CHANGE.search(text)
 
 
 def is_no(text: str) -> bool:
@@ -91,6 +99,24 @@ class Agent:
         self.max_steps = max_steps
         self.history_turns = history_turns
 
+    async def _calendar_note(self, ctx: ToolContext) -> str:
+        """Live upcoming calendar for logged-in users, so exam/holiday dates never come from a stale document."""
+        if ctx.role == PUBLIC or not ctx.token:
+            return ""
+        try:
+            start = ctx.today_date.isoformat()
+            end = (ctx.today_date + timedelta(days=30)).isoformat()
+            events = await asyncio.wait_for(
+                ctx.cached(f"cal:{start}:{end}", 120, lambda: ctx.kit.calendar(ctx.token, start, end)), 3)
+        except Exception:  # noqa: BLE001 - the note is an optimisation; tools still work without it
+            return ""
+        rows = [f"{e.get('date')} {e.get('type')}: {e.get('title')}" + (f" [{e['subject_code']}]" if e.get("subject_code") else "")
+                for e in (events or []) if isinstance(e, dict) and e.get("status", "active") == "active"]
+        if not rows:
+            return ""
+        return ("\nLive calendar for the next 30 days (authoritative; already reflects rescheduling circulars, so use "
+                "these dates over any date quoted in a document): " + "; ".join(rows[:25]) + ".")
+
     async def _run_tool(self, ctx: ToolContext, name: str, args: dict) -> Any:
         tool = get_tool(name, ctx.role)
         if not tool:
@@ -125,7 +151,7 @@ class Agent:
 
         if pending:
             self.store.set_pending_action(conversation_id, None)
-            if is_yes(user_text):
+            if is_plain_yes(user_text):
                 tool = get_tool(pending["tool"], ctx.role)
                 if tool is None:
                     return {"reply": "Sorry, that action isn't allowed for your account.", "actions": [], "provider": None}
@@ -146,9 +172,9 @@ class Agent:
                           "something else. If they changed details, call the action tool again with the new details.)")
 
         # The user is answering "yes" to a confirmation question the assistant just asked in its own words.
-        already_confirmed = (is_yes(user_text) and bool(history) and history[-1]["role"] == "assistant"
+        already_confirmed = (is_plain_yes(user_text) and bool(history) and history[-1]["role"] == "assistant"
                              and history[-1]["content"].rstrip().endswith("?"))
-        system = build_system_prompt(ctx) + extra_note
+        system = build_system_prompt(ctx) + await self._calendar_note(ctx) + extra_note
         schemas = [t.schema() for t in tools_for_role(ctx.role)]
         messages: list[dict] = history + [{"role": "user", "content": user_text}]
         provider = None

@@ -68,15 +68,34 @@ async def tool_context(svc: Services, session: dict) -> ToolContext:
                        today=today["date"], kb=svc.kb, cache=svc.cache)
 
 
+def client_ip(request: Request) -> str:
+    """Caller IP; behind Render's proxy the first X-Forwarded-For hop is the real client."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def client_key(request: Request) -> str:
     session = getattr(request.state, "session", None)
     if session:
         return session["sid"]
-    return request.client.host if request.client else "unknown"
+    return client_ip(request)
 
 
-def check_rate(limiter: RateLimiter, request: Request) -> None:
-    if not limiter.allow(client_key(request)):
+IP_SCALE = 4.0  # several real users (e.g. one campus Wi-Fi) can share an IP
+
+
+def check_rate(limiter: RateLimiter, request: Request, subject: str | None = None) -> None:
+    """Limit per session AND per IP, so dropping the cookie (a fresh session per request) doesn't bypass it.
+
+    ``subject`` (e.g. the login id) adds a per-IP+subject bucket at the normal rate, against password guessing.
+    """
+    ip = client_ip(request)
+    ok = limiter.allow(f"ip:{ip}", IP_SCALE) and limiter.allow(client_key(request))
+    if ok and subject:
+        ok = limiter.allow(f"subj:{ip}:{subject.lower()}")
+    if not ok:
         raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
 
 
